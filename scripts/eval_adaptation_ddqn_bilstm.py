@@ -53,17 +53,79 @@ output_root = Path(_resolve_output_dir(None))  # your resolver
 (output_root / ".gitkeep").touch(exist_ok=True)
 
 checkpoint_dir = _resolve_output_dir(None, default_name="runs/checkpoints")
+# --- NEW: where to save figures ---
+plots_dir = Path(r"C:\Projects\energyplus-gym-work\energyplus-gym\runs\plots")
+plots_dir.mkdir(parents=True, exist_ok=True)
+
+def _save_close(fig, fname: str):
+    out = plots_dir / fname
+    fig.savefig(out, dpi=200, bbox_inches="tight")
+    plt.close(fig)
+    print(f"[Saved plot] {out}")
+
+
+def _count_short_cycles(binary_series, min_stable_steps: int = 4) -> int:
+    """Count AHU state segments shorter than the target stable duration."""
+    arr = np.asarray(binary_series, dtype=int)
+    if arr.size == 0:
+        return 0
+
+    switch_points = np.flatnonzero(arr[1:] != arr[:-1]) + 1
+    segment_starts = np.r_[0, switch_points]
+    segment_ends = np.r_[switch_points, arr.size]
+    durations = segment_ends - segment_starts
+    return int(np.sum(durations < min_stable_steps))
+
+
+def _control_variation_metrics(series, valid_transition_mask):
+    """Return total, mean, and max absolute setpoint changes for valid transitions."""
+    arr = np.asarray(series, dtype=float)
+    valid = np.asarray(valid_transition_mask, dtype=bool)
+    diffs = np.abs(np.diff(arr))
+    selected = diffs[valid]
+
+    if selected.size == 0:
+        return 0.0, 0.0, 0.0
+
+    return (
+        float(np.sum(selected)),
+        float(np.mean(selected)),
+        float(np.max(selected)),
+    )
 
 
 
 #%%Deployment DDQN_BiLSTM (Adaptation test)
 n_episodes=50
+env_config = {
+    "output": str(output_dir),
+    "location": "luxembourg",
+
+    "enable_control_penalty": False,
+    "w_switch": 0.3,
+    "w_du_sat": 0.04,
+    "w_du_oac": 0.04,
+    "enable_iaq_aware_oac": False,
+    "iaq_co2_threshold": 900.0,
+    "iaq_oac_penalty_scale": 0.25,
+    "iaq_oac_energy_scale": 1.0,
+
+    "enable_pre_occupancy_comfort": False,
+    "w_precomfort": 0.3,
+    "enable_pre_occupancy_relaxation": False,
+    "pre_occ_ahu_energy_scale": 0.7,
+    "pre_occ_sat_energy_scale": 0.7,
+    "pre_occ_oac_energy_scale": 0.9,
+    "pre_occ_sat_penalty_scale": 0.75,
+}
+
 env = AmphitheaterEnv(
-    env_config={"output": str(output_dir),"location": "luxembourg"}, new_begin_month=1, new_end_month=1, new_begin_day=1, new_end_day=10,
+    env_config=env_config, new_begin_month=1, new_end_month=1, new_begin_day=1, new_end_day=10,
     train=False)
 
 env.runner_config.csv = True
 
+MODEL_LABEL = "DDQN-BiLSTM"
 # Create and load your DQN agent
 agent = DDQN_BiLSTM(
     gamma=0.99,
@@ -87,28 +149,41 @@ agent.q_eval.eval()
 scores = []
 action_temp = []
 action_flow = []
+action_proxy_cost = []
+ahu_cmd_series = []
 
 # --------------- Run the environment once, collect rewards ---------------
 state_window = deque(maxlen=96)
 done = False
 observation = env.reset()[0]
+state_window.append(observation)
 score = 0
 
 while not done:
     if len(state_window) < 96:
         action_idx = np.random.choice(agent.action_space)
-        score=0
+        count_score = False
     else:
         obs_seq = np.array(state_window, dtype=np.float32)
         action_idx = agent.choose_action_test(obs_seq)
+        count_score = True
     
     observation_, reward, terminated, truncated, _ = env.step(action_idx)
     action = env.valid_actions[action_idx]  # discrete -> continuous
 
-    score += reward
+    if count_score:
+        score += reward
     done = terminated or truncated
     observation = observation_
     state_window.append(observation)
+
+    ahu_cmd_series.append(int(action[2]))
+    action_proxy_cost.append(
+        (action[0] / 7) * action[2]
+        + (action[1] / 7) * action[2]
+        + action[2] / 5
+    )
+
     # Convert to real-world scale (optional if you need it)
     action_temp.append(
         env._rescale(action[0] * action[2], range1=(0, 8-1), range2=[15, 30])
@@ -128,8 +203,13 @@ env.close()
 # -------------------------------------------------------------
 CSV_PATH = Path(output_dir) / "eplusout.csv"
 
-DATE_SLICE = slice(96, 96*17)             # one week → 672 rows
+DATE_SLICE = slice(96, 96*17)             # one week -> 672 rows
 #DATE_SLICE = slice(192, 288)             # one day
+SHORT_CYCLE_MIN_STEPS = 4
+ahu_cmd_array = np.array(ahu_cmd_series, dtype=int)
+ahu_cmd_window = ahu_cmd_array[DATE_SLICE]
+n_switch_cmd = np.sum(ahu_cmd_window[1:] != ahu_cmd_window[:-1])
+print("AHU switching count (command):", n_switch_cmd)
 
 SMOOTH_WIN = 15                          # Savitzky–Golay window (odd)
 SMOOTH_POLY= 3                           # Savitzky–Golay poly order
@@ -172,8 +252,64 @@ clgThr= week["CLG HVAC 1 ADJUSTED BY 0 F:Schedule Value [](TimeStep)"]
 oat   = week["Environment:Site Outdoor Air Drybulb Temperature [C](TimeStep)"]
 occ   = week["MAISON DU SAVOIR AUDITORIUM OCC:Schedule Value [](TimeStep)"]
 ahu   = week["AHUS ONOFF:Schedule Value [](TimeStep)"]
+elec  = week["Electricity:HVAC [J](TimeStep)"]
+heat  = week["Heating:DistrictHeatingWater [J](TimeStep)"]
 temp_sp = action_temp[DATE_SLICE]
 flow_sp = action_flow[DATE_SLICE]
+action_proxy_energy_cost = float(np.sum(action_proxy_cost[DATE_SLICE]))
+total_electricity_hvac = float(elec.sum())
+total_district_heating = float(heat.sum())
+
+ahu_actual_array = ahu.to_numpy(dtype=int)
+n_switch_actual = np.sum(ahu_actual_array[1:] != ahu_actual_array[:-1])
+
+print("AHU switching count (actual state):", n_switch_actual)
+
+co2 = week["TZ_AMPHITHEATER:Zone Air CO2 Concentration [ppm](TimeStep)"]
+occupied_mask = occ.to_numpy() > 0
+zoneT_array = zoneT.to_numpy()
+htg_array = htgThr.to_numpy()
+clg_array = clgThr.to_numpy()
+co2_array = co2.to_numpy()
+
+occupied_temp_violation = int(np.sum(
+    occupied_mask & ((zoneT_array < htg_array) | (zoneT_array > clg_array))
+))
+occupied_co2_violation = int(np.sum(
+    occupied_mask & (co2_array > 1000.0)
+))
+short_cycle_count = _count_short_cycles(
+    ahu_actual_array,
+    min_stable_steps=SHORT_CYCLE_MIN_STEPS,
+)
+
+occupied_transition_mask = occupied_mask[1:] & occupied_mask[:-1]
+(
+    sat_total_variation_occ,
+    sat_avg_abs_change_occ,
+    sat_max_jump_occ,
+) = _control_variation_metrics(temp_sp, occupied_transition_mask)
+(
+    oa_total_variation_occ,
+    oa_avg_abs_change_occ,
+    oa_max_jump_occ,
+) = _control_variation_metrics(flow_sp, occupied_transition_mask)
+
+print("occupied_temp_violation:", occupied_temp_violation)
+print("occupied_co2_violation:", occupied_co2_violation)
+print("action_proxy_energy_cost:", action_proxy_energy_cost)
+print("total_electricity_hvac [J]:", total_electricity_hvac)
+print("total_district_heating [J]:", total_district_heating)
+print(
+    f"short_cycle_count (<{SHORT_CYCLE_MIN_STEPS} timesteps, actual AHU):",
+    short_cycle_count,
+)
+print("SAT total variation (occupied only):", sat_total_variation_occ)
+print("SAT average absolute change (occupied only):", sat_avg_abs_change_occ)
+print("SAT maximum jump (occupied only):", sat_max_jump_occ)
+print("OA flow total variation (occupied only):", oa_total_variation_occ)
+print("OA flow average absolute change (occupied only):", oa_avg_abs_change_occ)
+print("OA flow maximum jump (occupied only):", oa_max_jump_occ)
 
 # -------------------------------------------------------------
 #  1.  TEMPERATURE & SET-POINTS
@@ -187,7 +323,7 @@ ax.step(zoneT.index, temp_sp, label="Supply-air T set-point", color="tab:orange"
 # --- bold “DDQN Bi-LSTM” label – choose the spot yourself ----
 ax.text(
     0.3, 0.3,                # (x, y) in axes fraction: 0–1 left→right / bottom→top
-    "Q-Transformer",
+    MODEL_LABEL,
     transform=ax.transAxes,    # interpret coords in axes space
     fontsize=25,
     fontweight="bold",
@@ -276,7 +412,8 @@ ax.set_xlim(zoneT.index[0], zoneT.index[-1])
 ax.margins(x=0)
 plt.text(0.86, 0.99, f'Total Score: {score:.2f}', transform=plt.gca().transAxes, fontsize=20, verticalalignment='top')
 
-plt.show()
+# plt.show()
+_save_close(fig, "eval_adaptation_ddqn_bilstm_temperature_setpoints.png")
 
 
 
@@ -303,7 +440,7 @@ lines, labels = ax1.get_legend_handles_labels()
 lines2, labels2 = ax2.get_legend_handles_labels()
 ax1.legend(lines+lines2, labels+labels2, loc="upper left",fontsize=14)
 # 1) remove the white grid lines completely
-for a in (ax,ax2):
+for a in (ax1,ax2):
     a.grid(False)
 # Annotate totals
 tot_elec = elec.sum(); tot_heat = heat.sum()
@@ -315,7 +452,7 @@ ax1.set_xlim(elec.index[0], elec.index[-1])
 ax1.margins(x=0)
 ax1.text(
     0.3, 0.3,            # ← move left↔right / down↕up as you wish
-    "Q-Transformer",
+    MODEL_LABEL,
     transform=ax1.transAxes,
     fontsize=25,
     fontweight="bold",
@@ -336,6 +473,7 @@ split_dt = pd.Timestamp("2020-01-08 00:00:00")   # start of 8 Jan
 ax1.axvspan(split_dt, zoneT.index[-1],           # ← from split to end
            facecolor="#e6f7e6", alpha=1,     # ← light rose
            zorder=-5)                           # ← behind every artist
+_save_close(fig, "eval_adaptation_ddqn_bilstm_energy.png")
 # -------------------------------------------------------------
 #  3.  CO₂ CONCENTRATION
 # -------------------------------------------------------------
@@ -351,7 +489,7 @@ ax.xaxis.set_major_formatter(
 )
 ax.text(
     0.3, 0.3,            # same idea—adjust to suit this plot
-    "Q-Transformer",
+    MODEL_LABEL,
     transform=ax.transAxes,
     fontsize=25,
     fontweight="bold",
@@ -369,4 +507,5 @@ ax.axvspan(split_dt, zoneT.index[-1],           # ← from split to end
            zorder=-5)                           # ← behind every artist
 ax.set_xlim(co2.index[0], co2.index[-1])
 ax.margins(x=0)
-plt.show()    
+# plt.show()
+_save_close(fig, "eval_adaptation_ddqn_bilstm_co2.png")    

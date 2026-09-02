@@ -102,7 +102,7 @@ class AmphitheaterEnv(EnergyPlusEnv):
    
     def __init__(self, env_config=None, new_begin_month=1, new_end_month=12,
              new_begin_day=1, new_end_day=31,
-             train=True, w_t=100, w_co2=10, w_dh=10, w_elc=1):
+             train=True, w_t=1.0, w_co2=1.0, w_dh=10, w_elc=1):
         if env_config is None:
             env_config = {}
         # normalize location early so base class sees the canonical value
@@ -132,8 +132,7 @@ class AmphitheaterEnv(EnergyPlusEnv):
     @override(EnergyPlusEnv)
     def get_observation_space(self) -> gym.Space:
         # observation space:
-        # OAT, IAT, cooling setpoint, heating setpoint,number_occupant, district heating, time of the day, Electricity:HVAC, OAT_15, OAT_30, OAT_45, OAT_60,heating_setpoint_15,heating_setpoint_30,heating_setpoint_45,heating_setpoint_60,cooling_setpoint_15,cooling_setpoint_30,cooling_setpoint_45,cooling_setpoint_60
-       
+        # Original 18 state features.
         low_obs = np.array([
                            -20,                    #Dewpoint Temperature
                             10,                       #Relative Humidity
@@ -170,8 +169,8 @@ class AmphitheaterEnv(EnergyPlusEnv):
                            1,                                      #AHU state
                            40.0,                                   #IAT
                            2000,                       #CO2
-                           90152325.1800933,                       #DH
-                           672,                                    #time 
+                            90152325.1800933,                       #DH
+                            672,                                    #time 
                            5_037_597.12                            #elec
                            ])                          
 
@@ -272,7 +271,7 @@ class AmphitheaterEnv(EnergyPlusEnv):
         # -------------------------
         # You can adjust these according to your building’s typical comfort policies.
         T_min, T_max = obs["htg_spt"], obs["clg_spt"]        # Example comfort temperature range in °C
-        CO2_min, CO2_max = 400.0, 1000.0 # Example healthy CO2 range in ppm
+        CO2_max = 1000.0
 
         # Occupant presence factor
         occ = int(obs.get("occ", 0)!=0)
@@ -297,15 +296,8 @@ class AmphitheaterEnv(EnergyPlusEnv):
         # ------------------------------------------------------------------
         # 3. Compute CO2 penalty (again, only if occupied)
         # ------------------------------------------------------------------
-        co2 = obs.get("co2", 600.0)  # Some default
-        if co2>1000:
-            # e.g. penalty grows as we go further below 400 ppm
-            co2_penalty = 1
-        else :
-            co2_penalty = 0
-
-        # Again, scale by occupancy—only penalize when people are present
-        co2_penalty *= occ
+        co2 = obs.get("co2", 600.0)
+        co2_penalty = float(co2 > CO2_max) * occ
 
         # ------------------------------------------------
         # 4. Compute normalized energy penalty
@@ -325,11 +317,7 @@ class AmphitheaterEnv(EnergyPlusEnv):
         # 5. Weight & combine penalties into final reward
         # ------------------------------------------------
         # You can tune these hyperparameters to increase or decrease emphasis on each penalty.
-        w_temp = w_t      # weight for temperature discomfort
-        w_co2  = w_co2     # weight for CO2 discomfort
-        w_en_elec   = w_elc      # weight for energy usage
-        w_en_dh=w_dh
-        total_penalty = temp_penalty + co2_penalty 
+        total_penalty = w_t * temp_penalty + w_co2 * co2_penalty
 
         # By default, reward is the negative of total penalty.
         # That is, the agent is 'rewarded' more when the penalty is lower.

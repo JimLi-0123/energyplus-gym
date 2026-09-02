@@ -594,7 +594,7 @@ class EnergyPlusEnv(gym.Env, metaclass=abc.ABCMeta):
     implement the actual environment.
     '''
 
-    def __init__(self, env_config: Dict[str, Any], new_begin_month, new_end_month, new_begin_day, new_end_day,train=True,w_t=100, w_co2=10,w_dh=10,w_elc=1):
+    def __init__(self, env_config: Dict[str, Any], new_begin_month, new_end_month, new_begin_day, new_end_day,train=True,w_t=1.0, w_co2=1.0,w_dh=10,w_elc=1):
         self.spec = gym.envs.registration.EnvSpec(f"{self.__class__.__name__}")
         self.train=train
         self.env_config = env_config
@@ -607,7 +607,71 @@ class EnergyPlusEnv(gym.Env, metaclass=abc.ABCMeta):
         self.w_co2=w_co2
         self.w_dh=w_dh
         self.w_elc=w_elc
+        # self.action_space = self.get_action_space()
+        # --- NEW: optional control-chattering penalties ---
+        self.enable_control_penalty = bool(self.env_config.get("enable_control_penalty", False))
+
+        # penalty weights
+        self.w_switch = float(self.env_config.get("w_switch", 0.0))   # AHU 0/1 switching penalty
+        self.w_du_sat = float(self.env_config.get("w_du_sat", 0.0))   # SAT change penalty
+        self.w_du_oac = float(self.env_config.get("w_du_oac", 0.0))   # OAC flow change penalty
+        self.enable_iaq_aware_oac = bool(
+            self.env_config.get(
+                "enable_iaq_aware_oac",
+                self.env_config.get("enable_iaq_aware_ventilation", False),
+            )
+        )
+        self.iaq_co2_threshold = float(self.env_config.get("iaq_co2_threshold", 900.0))
+        self.iaq_switch_penalty_scale = float(
+            self.env_config.get("iaq_switch_penalty_scale", 1.0)
+        )
+        self.iaq_oac_penalty_scale = float(self.env_config.get("iaq_oac_penalty_scale", 0.25))
+        self.iaq_oac_energy_scale = float(self.env_config.get("iaq_oac_energy_scale", 1.0))
+        self.iaq_ahu_energy_scale = float(self.env_config.get("iaq_ahu_energy_scale", 1.0))
+        self.w_iaq_ventilation_deficit = float(
+            self.env_config.get("w_iaq_ventilation_deficit", 0.0)
+        )
+        self.iaq_target_oac_fraction = float(
+            self.env_config.get("iaq_target_oac_fraction", 0.6)
+        )
+        self.iaq_high_co2_threshold = float(
+            self.env_config.get("iaq_high_co2_threshold", 950.0)
+        )
+        self.iaq_high_target_oac_fraction = float(
+            self.env_config.get(
+                "iaq_high_target_oac_fraction",
+                self.iaq_target_oac_fraction,
+            )
+        )
+        self.iaq_co2_severity_threshold = float(
+            self.env_config.get("iaq_co2_severity_threshold", 1000.0)
+        )
+        self.w_iaq_co2_severity = float(self.env_config.get("w_iaq_co2_severity", 0.0))
+        self.enable_pre_occupancy_comfort = bool(
+            self.env_config.get("enable_pre_occupancy_comfort", False)
+        )
+        self.w_precomfort = float(self.env_config.get("w_precomfort", 0.0))
+        self.enable_pre_occupancy_relaxation = bool(
+            self.env_config.get("enable_pre_occupancy_relaxation", False)
+        )
+        self.pre_occ_ahu_energy_scale = float(
+            self.env_config.get("pre_occ_ahu_energy_scale", 1.0)
+        )
+        self.pre_occ_sat_energy_scale = float(
+            self.env_config.get("pre_occ_sat_energy_scale", 1.0)
+        )
+        self.pre_occ_oac_energy_scale = float(
+            self.env_config.get("pre_occ_oac_energy_scale", 1.0)
+        )
+        self.pre_occ_sat_penalty_scale = float(
+            self.env_config.get("pre_occ_sat_penalty_scale", 1.0)
+        )
+
+        # previous physical action = (sat, flow, ahu)
+        self._prev_action_phys = None
+
         self.action_space = self.get_action_space()
+
         #self.default_action = self.post_process_action(self.action_space.sample())
         #self.default_action= self.post_process_action((self.action_space.sample()[0][0],self.action_space.sample()[0][1],self.action_space.sample()[1]))    SAC
         self.default_action= self.post_process_action(self.valid_actions[self.action_space.sample()])
@@ -641,7 +705,7 @@ class EnergyPlusEnv(gym.Env, metaclass=abc.ABCMeta):
             verbose=self.env_config.get("verbose", False),
             eplus_timestep_duration=self.env_config.get("eplus_timestep_duration", 0.25),
         )
-                
+
         # Choose CSV name: allow an override via env_config["occupancy_csv"],
         # otherwise select a default based on env_config["location"].
         loc_key = _normalize_location(self.env_config.get("location", "Luxembourg"))
@@ -743,6 +807,48 @@ class EnergyPlusEnv(gym.Env, metaclass=abc.ABCMeta):
         # 10) Create a new DataFrame with 4 rows of zeros and concatenate
         zeros_df = pd.DataFrame(0, index=range(4), columns=df_filtered.columns)
         self.temp = pd.concat([df_filtered, zeros_df], ignore_index=True)
+
+    def _pre_occupancy_comfort_penalty(self, obs: Dict[str, float]) -> float:
+        if not self.enable_pre_occupancy_comfort:
+            return 0.0
+
+        if float(obs.get("occ", 0.0)) > 0.0:
+            return 0.0
+
+        horizons = (1, 2, 4)
+        max_idx = len(self.temp) - 1
+
+        for horizon in horizons:
+            idx = min(self.timestep + horizon, max_idx)
+            if float(self.temp["occupant"].iloc[idx]) <= 0.0:
+                continue
+
+            t_min = float(self.temp["HTG HVAC"].iloc[idx])
+            t_max = float(self.temp["CLG HVAC"].iloc[idx])
+            iat = float(obs.get("iat", 22.5))
+
+            if iat < t_min:
+                return self.w_precomfort * (t_min - iat)
+            if iat > t_max:
+                return self.w_precomfort * (iat - t_max)
+            return 0.0
+
+        return 0.0
+
+    def _pre_occupancy_active(self, obs: Dict[str, float]) -> bool:
+        if not self.enable_pre_occupancy_relaxation:
+            return False
+
+        if float(obs.get("occ", 0.0)) > 0.0:
+            return False
+
+        max_idx = len(self.temp) - 1
+        for horizon in (1, 2, 4):
+            idx = min(self.timestep + horizon, max_idx)
+            if float(self.temp["occupant"].iloc[idx]) > 0.0:
+                return True
+
+        return False
         
    
 
@@ -794,9 +900,10 @@ class EnergyPlusEnv(gym.Env, metaclass=abc.ABCMeta):
         self.episode += 1
         self.timestep = 0
         self.last_obs = self.observation_space.sample()
-        self.score=0
-        self.violation_counter=0
+        self.score = 0
+        self.violation_counter = 0
         #self.previous_action=-1
+        self._prev_action_phys = None
         if self.energyplus_runner is not None:
             self.energyplus_runner.stop()
 
@@ -817,7 +924,8 @@ class EnergyPlusEnv(gym.Env, metaclass=abc.ABCMeta):
         # wait until E+ is ready.
         self.last_obs = obs = self.energyplus_runner.init_exchange(default_action=self.default_action)
         #date=str(self.month).zfill(2) + "/" + str(self.day).zfill(2)
-        return np.array(  # Sequential Data (20 elements)
+        obs["occ"] = obs["occ"] * 400
+        return np.array(  # Sequential Data
             # Dewpoint Temperature (odp)
             [obs["odp"]]
             +
@@ -873,6 +981,7 @@ class EnergyPlusEnv(gym.Env, metaclass=abc.ABCMeta):
         self.timestep += 1
         terminated = False
         truncated = False
+        action_phys = None
         # in case of training in complete month----------------------------------------
         
         if self.timestep%672==0 and self.train==True:
@@ -891,6 +1000,10 @@ class EnergyPlusEnv(gym.Env, metaclass=abc.ABCMeta):
         else:
             # post-process action
             action_to_apply = self.post_process_action(action)
+            # --- NEW: keep physical action before appending occupancy ---
+            # order is confirmed by post_process_action:
+            # (sat, flow, ahu)
+            action_phys = tuple(action_to_apply)
             # Enqueue action (sent to EnergyPlus through dedicated callback)
             # then wait to get next observation.
             # Timeout is set to 2s to handle end of simulation cases, which happens async
@@ -917,8 +1030,90 @@ class EnergyPlusEnv(gym.Env, metaclass=abc.ABCMeta):
             else:
                 self.last_obs = obs
        
-        reward = self.compute_reward(obs,w_t=self.w_t,w_co2=self.w_co2,w_dh=self.w_dh,w_elc=self.w_elc) -(action[0]/7)*action[2]  -(action[1]/7)*action[2] -action[2]/5
-           
+        iaq_active = (
+            self.enable_iaq_aware_oac
+            and float(obs.get("occ", 0.0)) > 0.0
+            and float(obs.get("co2", 0.0)) > self.iaq_co2_threshold
+        )
+        effective_oac_energy_scale = self.iaq_oac_energy_scale if iaq_active else 1.0
+        iaq_ahu_energy_scale = self.iaq_ahu_energy_scale if iaq_active else 1.0
+        iaq_ventilation_deficit_pen = 0.0
+        iaq_co2_severity_pen = 0.0
+        if iaq_active:
+            oac_fraction = float(action[1]) / 7.0 if int(action[2]) else 0.0
+            co2_value = float(obs.get("co2", 0.0))
+            target_oac_fraction = (
+                self.iaq_high_target_oac_fraction
+                if co2_value > self.iaq_high_co2_threshold
+                else self.iaq_target_oac_fraction
+            )
+            target_oac = max(0.0, min(1.0, target_oac_fraction))
+            iaq_ventilation_deficit_pen = (
+                self.w_iaq_ventilation_deficit * max(0.0, target_oac - oac_fraction)
+            )
+            iaq_co2_severity_pen = (
+                self.w_iaq_co2_severity
+                * max(0.0, co2_value - self.iaq_co2_severity_threshold)
+                / 100.0
+            )
+        pre_occupancy_active = self._pre_occupancy_active(obs)
+        effective_ahu_energy_scale = (
+            self.pre_occ_ahu_energy_scale if pre_occupancy_active else 1.0
+        )
+        effective_ahu_energy_scale *= iaq_ahu_energy_scale
+        effective_sat_energy_scale = (
+            self.pre_occ_sat_energy_scale if pre_occupancy_active else 1.0
+        )
+        effective_pre_occ_oac_energy_scale = (
+            self.pre_occ_oac_energy_scale if pre_occupancy_active else 1.0
+        )
+        effective_oac_energy_scale *= effective_pre_occ_oac_energy_scale
+
+        reward = (
+            self.compute_reward(obs,w_t=self.w_t,w_co2=self.w_co2,w_dh=self.w_dh,w_elc=self.w_elc)
+            - self._pre_occupancy_comfort_penalty(obs)
+            - effective_sat_energy_scale*(action[0]/7)*action[2]
+            - effective_oac_energy_scale*(action[1]/7)*action[2]
+            - effective_ahu_energy_scale*action[2]/5
+            - iaq_ventilation_deficit_pen
+            - iaq_co2_severity_pen
+        )
+        # --- optional penalty for AHU switching + control variation ---
+        if self.enable_control_penalty and action_phys is not None:
+            switch_pen = 0.0
+            du_pen = 0.0
+
+            sat, oac, ahu = action_phys
+
+            if self._prev_action_phys is not None:
+                prev_sat, prev_oac, prev_ahu = self._prev_action_phys
+
+                # 1) AHU switching penalty
+                effective_w_switch = self.w_switch
+                if iaq_active:
+                    effective_w_switch *= self.iaq_switch_penalty_scale
+                switch_pen = effective_w_switch * float(int(ahu) != int(prev_ahu))
+
+                # 2) control variation penalty. When IAQ risk is high, relax the
+                # OA-flow smoothing penalty so ventilation can react faster.
+                effective_w_du_oac = self.w_du_oac
+                if iaq_active:
+                    effective_w_du_oac *= self.iaq_oac_penalty_scale
+
+                effective_w_du_sat = self.w_du_sat
+                if pre_occupancy_active:
+                    effective_w_du_sat *= self.pre_occ_sat_penalty_scale
+
+                du_pen = (
+                    effective_w_du_sat * abs(float(sat) - float(prev_sat))
+                    + effective_w_du_oac * abs(float(oac) - float(prev_oac))
+                )
+
+            reward -= (switch_pen + du_pen)
+
+        # update previous action only when current physical action exists
+        if action_phys is not None:
+            self._prev_action_phys = action_phys
         
         
         obs["occ"] = obs["occ"]*400
@@ -971,7 +1166,7 @@ class EnergyPlusEnv(gym.Env, metaclass=abc.ABCMeta):
             [obs["co2"]]+                                                #CO2
             [obs["dh"]]+                                                 #DH
             [self.timestep%672]+                                          #time
-            [obs["elec"]],                                               #elec
+            [obs["elec"]],                                                #elec
             dtype='float32')
         
         

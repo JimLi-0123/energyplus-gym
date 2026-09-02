@@ -51,15 +51,54 @@ output_root = Path(_resolve_output_dir(None))  # your resolver
 (output_root / ".gitkeep").touch(exist_ok=True)
 
 checkpoint_dir = _resolve_output_dir(None, default_name="runs/checkpoints")
+
+
+ROLLING_WINDOWS = [
+    (1, 7),
+]
+
+
+def make_training_env(env_config, begin_day: int, end_day: int):
+    env = AmphitheaterEnv(
+        env_config=env_config,
+        new_begin_month=1, new_end_month=1,
+        new_begin_day=begin_day, new_end_day=end_day,
+        train=True,
+    )
+    env.runner_config.csv = False
+    return env
+
+
 #%% Adaptation test (Q-transformer)--------------------------------------------------------------------------------------------------------------------------
 if __name__ == '__main__':
     
     
-    
-    env = AmphitheaterEnv(
-        env_config={"output": str(output_dir),"location": "luxembourg"}, new_begin_month=1, new_end_month=1, new_begin_day=1, new_end_day=7,
-        train=True)
-    env.runner_config.csv = False
+    env_config = {
+        "output": str(output_dir),
+        "location": "luxembourg",
+
+        # 新增：控制 penalty 開關
+        "enable_control_penalty": True,
+
+        # 新增：權重
+        "w_switch": 0.3,
+        "w_du_sat": 0.04,
+        "w_du_oac": 0.04,
+        "enable_iaq_aware_oac": False,
+        "iaq_co2_threshold": 900.0,
+        "iaq_oac_penalty_scale": 0.25,
+        "iaq_oac_energy_scale": 1.0,
+        
+        "enable_pre_occupancy_comfort": False,
+        "w_precomfort": 0.3,
+        "enable_pre_occupancy_relaxation": False,
+        "pre_occ_ahu_energy_scale": 0.7,
+        "pre_occ_sat_energy_scale": 0.7,
+        "pre_occ_oac_energy_scale": 0.9,
+        "pre_occ_sat_penalty_scale": 0.75,
+    }
+
+    env = make_training_env(env_config, *ROLLING_WINDOWS[0])
 
     best_score = -np.inf
     load_checkpoint = False
@@ -99,15 +138,14 @@ if __name__ == '__main__':
     for i in range(n_episodes):
         Episode += 1
         done = False
+        begin_day, end_day = ROLLING_WINDOWS[i % len(ROLLING_WINDOWS)]
 
-        # If the episode just terminated, reset env
-        
-        # if terminated:  # in case of generalisation test
-        if terminated :
-            env.close()
-            observation = env.reset()[0]  # or env.reset()
-            #state_window.clear()
-            state_window.append(observation)
+        env.close()
+        env = make_training_env(env_config, begin_day, end_day)
+        observation = env.reset()[0]
+        # Keep the original baseline behavior: do not clear the sequence
+        # buffer between fixed Jan1-Jan7 episodes.
+        state_window.append(observation)
 
         score = 0
 
@@ -144,6 +182,7 @@ if __name__ == '__main__':
 
         avg_score = np.mean(scores[-100:])
         print('Episode:', Episode,
+              f'Window: Jan{begin_day}-Jan{end_day}',
               'Score:', score,
               'Average score: %.1f' % avg_score,
               'Best score: %.2f' % best_score,
@@ -198,5 +237,16 @@ if __name__ == '__main__':
 
     plt.title('Scores and Epsilon History Over Episodes')
     fig.tight_layout()
-    plt.show()
+    # plt.show()
+    # --- NEW: save metrics + figure (Q-Transformer) ---
+    metrics_path = Path(_resolve_output_dir(None, default_name="runs/metrics")) / "adaptation_q_transformer_metrics.pkl"
+    save_training_metrics(str(metrics_path), scores, eps_history, steps_array)
+
+    plot_path = Path(_resolve_output_dir(None, default_name="runs/plots")) / "adaptation_q_transformer_scores_epsilon.png"
+    plot_path.parent.mkdir(parents=True, exist_ok=True)
+    fig.savefig(plot_path, dpi=200, bbox_inches="tight")
+    plt.close(fig)
+
+    print(f"[Saved plot] {plot_path}")
+    print(f"[Saved metrics] {metrics_path}")
     

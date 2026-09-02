@@ -53,6 +53,25 @@ output_root = Path(_resolve_output_dir(None))  # your resolver
 
 checkpoint_dir = _resolve_output_dir(None, default_name="runs/checkpoints")
 
+CONTROL_PENALTY_CONFIG = {
+    "enable_control_penalty": True,
+    "w_switch": 0.3,
+    "w_du_sat": 0.04,
+    "w_du_oac": 0.04,
+    "enable_iaq_aware_ventilation": True,
+    "iaq_co2_threshold": 850.0,
+    "iaq_switch_penalty_scale": 0.5,
+    "iaq_oac_penalty_scale": 0.35,
+    "iaq_oac_energy_scale": 0.4,
+    "iaq_ahu_energy_scale": 0.35,
+    "iaq_target_oac_fraction": 0.4,
+    "iaq_high_co2_threshold": 950.0,
+    "iaq_high_target_oac_fraction": 0.65,
+    "w_iaq_ventilation_deficit": 1.0,
+    "iaq_co2_severity_threshold": 1000.0,
+    "w_iaq_co2_severity": 0.8,
+}
+
 
     
 
@@ -69,14 +88,15 @@ if __name__ == '__main__':
     
     
     env = AmphitheaterEnv(
-        env_config={"output": str(output_dir),"location": "luxembourg"}, new_begin_month=1, new_end_month=12, new_begin_day=1, new_end_day=31,
+        env_config={"output": str(output_dir), "location": "luxembourg", **CONTROL_PENALTY_CONFIG}, new_begin_month=1, new_end_month=12, new_begin_day=1, new_end_day=31,
         train=True)
     env.runner_config.csv = False
 
     best_score = -np.inf
     load_checkpoint = False
     total_deployment_load_checkpoint = False
-    n_episodes = 50
+    # n_episodes = 50
+    n_episodes = 183
     
 
 
@@ -164,8 +184,9 @@ if __name__ == '__main__':
     env.close()
     agent.save_models()
     
-    #metrics_file = "C:/Users/khali/Desktop/code_phd_13_8_2024/Agent3/conference_paper/Q-tansformer/adaptation_test/nodropout/training_metrics.pkl"
-    #save_training_metrics(metrics_file, scores, eps_history, steps_array)
+    metrics_path = Path(_resolve_output_dir(None, default_name="runs/metrics")) / "generalisation_ddqn_mlp_metrics.pkl"
+    save_training_metrics(str(metrics_path), scores, eps_history, steps_array)
+    print(f"[Saved metrics] {metrics_path}")
     # -----------------------------------------------------------------
     # Plotting as in your original script
     # -----------------------------------------------------------------
@@ -202,5 +223,10 @@ if __name__ == '__main__':
 
     plt.title('Scores and Epsilon History Over Episodes')
     fig.tight_layout()
-    plt.show()
 
+    plot_path = Path(_resolve_output_dir(None, default_name="runs/plots")) / "generalisation_ddqn_mlp_scores_epsilon.png"
+    plot_path.parent.mkdir(parents=True, exist_ok=True)
+    fig.savefig(plot_path, dpi=200, bbox_inches="tight")
+
+    plt.close(fig)
+    print(f"[Saved plot] {plot_path}")

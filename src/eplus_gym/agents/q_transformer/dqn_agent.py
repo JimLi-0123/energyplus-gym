@@ -17,12 +17,13 @@ from eplus_gym.envs.energyplus import _find_project_root
 class Q_transformer(object):
     def __init__(self, gamma, epsilon, lr, input_dims, n_actions,
                  mem_size, eps_min, batch_size, replace, eps_dec,
-                 chkpt_dir, algo, env_name):
+                 chkpt_dir, algo, env_name,
+                 co2_aux_weight=0.1, co2_feature_indices=(14,)):
         self.gamma = gamma
         self.epsilon = epsilon
         self.lr = lr
         self.n_actions = n_actions
-        self.input_dims = input_dims  # e.g. (18,)
+        self.input_dims = input_dims
         self.mem_size = mem_size
         self.batch_size = batch_size
         self.eps_min = eps_min
@@ -33,6 +34,10 @@ class Q_transformer(object):
         self.chkpt_dir = chkpt_dir
         self.action_space = [i for i in range(n_actions)]
         self.learn_step_counter = 0
+        self.co2_aux_weight = co2_aux_weight
+        self.co2_feature_indices = tuple(co2_feature_indices)
+        self.last_q_loss = None
+        self.last_co2_aux_loss = None
 
         # Exponential epsilon decay
         self.epsilon_decay_episodes = (self.eps_min / max(self.eps_min, self.epsilon)) ** (1 / self.eps_dec)
@@ -53,7 +58,9 @@ class Q_transformer(object):
             n_actions=self.n_actions,
             name=self.env_name + '_' + self.algo + '_q_eval',
             input_dims=self.input_dims,
-            chkpt_dir=self.chkpt_dir
+            chkpt_dir=self.chkpt_dir,
+            co2_output_dim=len(self.co2_feature_indices),
+            co2_feature_indices=self.co2_feature_indices
         )
 
         self.q_next = DeepQNetwork(
@@ -61,7 +68,9 @@ class Q_transformer(object):
             n_actions=self.n_actions,
             name=self.env_name + '_' + self.algo + '_q_next',
             input_dims=self.input_dims,
-            chkpt_dir=self.chkpt_dir
+            chkpt_dir=self.chkpt_dir,
+            co2_output_dim=len(self.co2_feature_indices),
+            co2_feature_indices=self.co2_feature_indices
         )
 
         # -------------
@@ -70,31 +79,40 @@ class Q_transformer(object):
         proj_root = _find_project_root()
         qtx_dir = (proj_root / "src" / "eplus_gym"  / "envs" / "assets" / "normalization" / "Q-transformer.csv")
         self.sample_data = pd.read_csv(qtx_dir).to_numpy()
+        self.sample_data = self._match_normalization_features(self.sample_data, self.input_dims[0])
         self.scaler = MinMaxScaler()
         self.scaler.fit(self.sample_data)
+
+    def _match_normalization_features(self, sample_data, target_dim):
+        if sample_data.shape[1] == target_dim:
+            return sample_data
+
+        raise ValueError(
+            f"Normalizer feature count mismatch: CSV has {sample_data.shape[1]} "
+            f"features but environment has {target_dim}."
+        )
 
     # -------------------------------------------------------
     # Action selection using single Q(s,a) => loop over actions
     # -------------------------------------------------------
     def choose_action_test(self, recent_96_states):
         """
-        Given the last 96 time-steps of state features (shape (96,18)),
+        Given the last 96 time-steps of state features (shape (96,state_dim)),
         choose an action in discrete space 0..n_actions-1.
         """
         if np.random.random() < self.epsilon:
             # Exploration
             action = np.random.choice(self.action_space)
         else:
-            # 1) Flatten to shape (96, 18) => (96, 18)
-            #    Actually already shape (96,18), but let's ensure it's an np.array
+            # 1) Ensure the input is an np.array with shape (96, state_dim).
             obs_np = np.array(recent_96_states, dtype=np.float32)
 
             # 2) Scale with the same scaler used in training.
-            #    Flatten to (96,18)->(96*18,) if your scaler expects 2D, then reshape back
-            obs_flat = obs_np.reshape(-1, obs_np.shape[-1])  # shape (96, 18)
-            obs_flat = self.scaler.transform(obs_flat)       # scaled shape (96, 18)
+            #    Flatten to 2D for the scaler, then reshape back.
+            obs_flat = obs_np.reshape(-1, obs_np.shape[-1])  # shape (96, state_dim)
+            obs_flat = self.scaler.transform(obs_flat)       # scaled shape (96, state_dim)
 
-            # 3) Reshape back to (96, 18) and then expand batch dim => (1,96,18)
+            # 3) Reshape back and then expand batch dim => (1, 96, state_dim)
             obs_scaled = obs_flat.reshape(96, obs_np.shape[-1])
             S_3d = T.tensor(obs_scaled, dtype=T.float).unsqueeze(0).to(self.q_eval.device)
 
@@ -157,12 +175,15 @@ class Q_transformer(object):
 
         flat_S  = self.scaler.transform(flat_S)
         flat_Sn = self.scaler.transform(flat_Sn)
+        norm_next_seq = flat_Sn.reshape(B, seq_len, -1)
+        co2_targets = norm_next_seq[:, -1, self.co2_feature_indices]
 
         # Reshape back
         seq_states_t = T.tensor(flat_S.reshape(B, seq_len, -1),
                                 dtype=T.float).to(self.q_eval.device)
-        seq_next_t   = T.tensor(flat_Sn.reshape(B, seq_len, -1),
+        seq_next_t   = T.tensor(norm_next_seq,
                                 dtype=T.float).to(self.q_eval.device)
+        co2_targets_t = T.tensor(co2_targets, dtype=T.float).to(self.q_eval.device)
 
         # Convert actions, rewards, dones
         # seq_actions shape = (B,1) => we want a 1D LongTensor for gather
@@ -171,30 +192,36 @@ class Q_transformer(object):
         dones   = T.tensor(seq_dones, dtype=T.bool).to(self.q_eval.device)
 
         # 3) Current Q-values => shape (B, n_actions)
-        q_pred_all = self.q_eval(seq_states_t)  # (B, n_actions)
+        q_pred_all, co2_pred = self.q_eval(seq_states_t, return_aux=True)
 
         # We gather the Q-value for the action that was actually taken
         q_pred = q_pred_all.gather(1, actions.unsqueeze(1)).squeeze(1)  # shape (B,)
 
         # 4) Next Q-values for double DQN
         # Evaluate next state with q_eval to get best actions
-        q_eval_next_all = self.q_eval(seq_next_t)  # (B, n_actions)
-        best_actions = q_eval_next_all.argmax(dim=1)  # shape (B,)
+        with T.no_grad():
+            q_eval_next_all = self.q_eval(seq_next_t)  # (B, n_actions)
+            best_actions = q_eval_next_all.argmax(dim=1)  # shape (B,)
 
-        # Evaluate next state with q_next to get target
-        q_next_all = self.q_next(seq_next_t)  # (B, n_actions)
+            # Evaluate next state with q_next to get target
+            q_next_all = self.q_next(seq_next_t)  # (B, n_actions)
 
-        # 5) Zero out any next Q-values if done
-        q_next_all[dones] = 0.0
+            # 5) Zero out any next Q-values if done
+            q_next_all[dones] = 0.0
 
-        # 6) The target
-        indices = T.arange(B).long().to(self.q_eval.device)
-        q_target = rewards + self.gamma * q_next_all[indices, best_actions]
+            # 6) The target
+            indices = T.arange(B).long().to(self.q_eval.device)
+            q_target = rewards + self.gamma * q_next_all[indices, best_actions]
 
         # 7) Loss and backprop
-        loss = self.q_eval.loss(q_target, q_pred).to(self.q_eval.device)
+        q_loss = self.q_eval.loss(q_pred, q_target).to(self.q_eval.device)
+        co2_aux_loss = self.q_eval.loss(co2_pred, co2_targets_t).to(self.q_eval.device)
+        loss = q_loss + self.co2_aux_weight * co2_aux_loss
         loss.backward()
         self.q_eval.optimizer.step()
+
+        self.last_q_loss = q_loss.item()
+        self.last_co2_aux_loss = co2_aux_loss.item()
 
         self.learn_step_counter += 1
     

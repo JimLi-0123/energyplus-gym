@@ -19,7 +19,7 @@ class ReplayBuffer(object):
         self.sac_mem_size = sac_max_size
         self.sac_mem_cntr = 0
 
-        # Each state is shape input_shape, e.g. (18,) if your environment has 18 features
+        # Each state is shape input_shape.
         self.state_memory = np.zeros((self.sac_mem_size, *input_shape),
                                      dtype=np.float32)
         self.new_state_memory = np.zeros((self.sac_mem_size, *input_shape),
@@ -36,13 +36,13 @@ class ReplayBuffer(object):
         self.transformer_mem_size = transformer_max_size
         self.t_mem_cntr = 0
         
-        # For storing 96 consecutive states, each with 18 features
+        # For storing 96 consecutive states.
         self.sequence_length = 96
-        self.state_dim = 18
+        self.state_dim = input_shape[0] if len(input_shape) == 1 else int(np.prod(input_shape))
         
-        # S shape = (96, 18)
+        # S shape = (96, state_dim)
         self.transformer_state_dim = (self.sequence_length, self.state_dim)
-        # S' shape = (96, 18)
+        # S' shape = (96, state_dim)
         self.transformer_next_state_dim = (self.sequence_length, self.state_dim)
         # A shape = (1,) (the action at the final step of S)
         self.transformer_action_dim = 1
@@ -63,9 +63,8 @@ class ReplayBuffer(object):
         self.transformer_reward_memory = np.zeros(self.transformer_mem_size, dtype=np.float32)
         self.transformer_done_memory   = np.zeros(self.transformer_mem_size, dtype=bool)
 
-        # If you ever want to filter or reorder features, you could do so here,
-        # but for simplicity we'll just store all 18 features.
-        self.relevant_indices = list(range(self.state_dim))  # [0..17]
+        # If you ever want to filter or reorder features, you could do so here.
+        self.relevant_indices = list(range(self.state_dim))
 
     # ----------------------------------------------------
     # 3) Storing a Transition in Buffer b AND building (S, A, S', r, done) for B
@@ -108,7 +107,7 @@ class ReplayBuffer(object):
                 idx = (current_idx - (self.sequence_length - 1 - offset)) % self.sac_mem_size
                 full_state = self.state_memory[idx, self.relevant_indices]
                 state_seq.append(full_state)
-            state_seq = np.array(state_seq, dtype=np.float32)  # shape (96, 18)
+            state_seq = np.array(state_seq, dtype=np.float32)  # shape (96, state_dim)
 
             # -------------
             # Build A (the action at the final step)
@@ -125,7 +124,7 @@ class ReplayBuffer(object):
                 idx = (current_idx - (self.sequence_length - 1 - offset)) % self.sac_mem_size
                 full_next_state = self.new_state_memory[idx, self.relevant_indices]
                 next_state_seq.append(full_next_state)
-            next_state_seq = np.array(next_state_seq, dtype=np.float32)  # shape (96, 18)
+            next_state_seq = np.array(next_state_seq, dtype=np.float32)  # shape (96, state_dim)
 
             # -------------
             # r, done from the "current" single-step transition
@@ -173,9 +172,9 @@ class ReplayBuffer(object):
         """
         Return a batch of (S, A, S', r, done) for Transformer-based training.
 
-         - S: shape (batch_size, 96, 18)
+         - S: shape (batch_size, 96, state_dim)
          - A: shape (batch_size, 1)
-         - S': shape (batch_size, 96, 18)
+         - S': shape (batch_size, 96, state_dim)
          - r: shape (batch_size,)
          - done: shape (batch_size,)
         """
@@ -186,9 +185,9 @@ class ReplayBuffer(object):
 
         batch_idx = np.random.choice(max_t, batch_size, replace=False)
 
-        seq_states  = self.transformer_state_memory[batch_idx]      # (batch_size, 96, 18)
+        seq_states  = self.transformer_state_memory[batch_idx]      # (batch_size, 96, state_dim)
         seq_actions = self.transformer_action_memory[batch_idx]     # (batch_size, 1)
-        seq_next    = self.transformer_next_state_memory[batch_idx] # (batch_size, 96, 18)
+        seq_next    = self.transformer_next_state_memory[batch_idx] # (batch_size, 96, state_dim)
         seq_r       = self.transformer_reward_memory[batch_idx]     # (batch_size,)
         seq_done    = self.transformer_done_memory[batch_idx]       # (batch_size,)
 
