@@ -23,7 +23,9 @@ from eplus_gym.envs.energyplus import (
     _resolve_output_dir,
     _find_project_root,
 )
+from eplus_gym.seeding import run_seeded_script, seed_suffix
 from eplus_gym.agents.q_transformer.dqn_agent import Q_transformer
+from eplus_gym.agents.q_transformer.experiment_naming import gate_aux_tag
 
 
 # -----------------------------------------------------------------------------
@@ -82,8 +84,28 @@ output_root = Path(_resolve_output_dir(None))
 
 checkpoint_dir = _resolve_output_dir(None, default_name="runs/checkpoints")
 
-ALGO_NAME = "CO2-gated-aux-Q-transformer"
-EXPERIMENT_TAG = "co2_gated_aux"
+GATE_CONFIG = {
+    "use_gate": True,
+    "use_co2_gate": True,
+    "use_iat_gate": False,
+    "co2_gate_weight": 1.0,
+    "iat_gate_weight": 0.0,
+    "iat_feature_index": 13,
+    "iat_comfort_low": 21.0,
+    "iat_comfort_high": 24.0,
+}
+
+ABLATION_CONFIG = {
+    "use_co2_aux": False,
+    "co2_aux_weight": 0.0,
+    "use_iat_aux": False,
+    "iat_aux_weight": 0.0,
+    "use_occ_aux": True,
+    "occ_aux_weight": 0.1,
+    "occ_feature_index": 7,
+    "occ_predict_delta": True,
+    **GATE_CONFIG,
+}
 
 CONTROL_PENALTY_CONFIG = {
     "enable_control_penalty": False,
@@ -104,6 +126,8 @@ CONTROL_PENALTY_CONFIG = {
     "w_iaq_co2_severity": 0.8,
 }
 
+ALGO_NAME = f"Q-transformer_{gate_aux_tag(ABLATION_CONFIG)}"
+
 
 #%% Generalisation test (Q-transformer)
 
@@ -119,7 +143,8 @@ EVAL_LOCATIONS = [
 ]
 
 
-def evaluate_location(location_label: str, location_key: str):
+def evaluate_location(location_label: str, location_key: str, seed: int):
+    current_seed_suffix = seed_suffix(seed)
     env = AmphitheaterEnv(
         env_config={"output": str(output_dir), "location": location_key, **CONTROL_PENALTY_CONFIG},
         new_begin_month=1,
@@ -142,8 +167,9 @@ def evaluate_location(location_label: str, location_key: str):
         replace=384,
         eps_dec=0.9 * n_days * 366,
         chkpt_dir=checkpoint_dir,
-        algo=ALGO_NAME,
-        env_name='energyplus'
+        algo=f"{ALGO_NAME}{current_seed_suffix}",
+        env_name='energyplus',
+        **ABLATION_CONFIG
     )
 
     agent.load_models()
@@ -157,7 +183,7 @@ def evaluate_location(location_label: str, location_key: str):
 
     state_window = deque(maxlen=96)
     done = False
-    observation = env.reset()[0]
+    observation = env.reset(seed=seed)[0]
     score = 0
 
     while not done:
@@ -393,10 +419,20 @@ def _annotate_bars(ax, bars, fmt):
         )
 
 
-def save_summary_plot(results):
+def summary_experiment_tag():
+    tag_parts = [
+        gate_aux_tag(ABLATION_CONFIG),
+        "control_penalty_on" if CONTROL_PENALTY_CONFIG["enable_control_penalty"] else "control_penalty_off",
+    ]
+    if CONTROL_PENALTY_CONFIG.get("enable_iaq_aware_ventilation", False):
+        tag_parts.append("iaq_on")
+    return "_".join(tag_parts)
+
+
+def save_summary_plot(results, output_stem: str):
     plots_dir = Path(_resolve_output_dir(None, default_name="runs/plots"))
     plots_dir.mkdir(parents=True, exist_ok=True)
-    plot_path = plots_dir / "eval_generalisation_co2_gated_aux_q_transformer_summary.png"
+    plot_path = plots_dir / f"{output_stem}.png"
 
     locations = [item["location"] for item in results]
     average_scores = [item["average_score"] for item in results]
@@ -429,33 +465,29 @@ def save_summary_plot(results):
         ax.grid(axis="y", alpha=0.3)
 
     fig.tight_layout()
-    fig.savefig(plot_path, dpi=200, bbox_inches="tight")
-    plt.close(fig)
+    try:
+        fig.savefig(plot_path, dpi=200, bbox_inches="tight")
+    finally:
+        plt.close(fig)
     print(f"[Saved plot] {plot_path}")
 
 
-def save_summary_metrics(results):
+def save_summary_metrics(results, output_stem: str):
     metrics_dir = Path(_resolve_output_dir(None, default_name="runs/metrics"))
     metrics_dir.mkdir(parents=True, exist_ok=True)
-    tag_parts = [
-        EXPERIMENT_TAG,
-        "control_penalty_on" if CONTROL_PENALTY_CONFIG["enable_control_penalty"] else "control_penalty_off",
-    ]
-    if CONTROL_PENALTY_CONFIG.get("enable_iaq_aware_ventilation", False):
-        tag_parts.append("iaq_on")
-    tag = "_".join(tag_parts)
-    df = pd.DataFrame(results)
-    metrics_path = metrics_dir / "eval_generalisation_q_transformer_summary.csv"
-    tagged_metrics_path = metrics_dir / f"eval_generalisation_q_transformer_summary_{tag}.csv"
-    df.to_csv(metrics_path, index=False)
-    df.to_csv(tagged_metrics_path, index=False)
+    metrics_path = metrics_dir / f"{output_stem}.csv"
+    pd.DataFrame(results).to_csv(metrics_path, index=False)
     print(f"[Saved metrics] {metrics_path}")
-    print(f"[Saved metrics] {tagged_metrics_path}")
 
 
 if __name__ == '__main__':
+    CURRENT_SEED = run_seeded_script()
+    output_stem = (
+        f"eval_generalisation_q_transformer_summary_{summary_experiment_tag()}"
+        f"{seed_suffix(CURRENT_SEED)}"
+    )
     results = []
     for label, key in EVAL_LOCATIONS:
-        results.append(evaluate_location(label, key))
-    save_summary_metrics(results)
-    save_summary_plot(results)
+        results.append(evaluate_location(label, key, CURRENT_SEED))
+    save_summary_metrics(results, output_stem)
+    save_summary_plot(results, output_stem)

@@ -9,6 +9,7 @@ Created on Wed Jan  7 07:25:12 2026
 # Standard library
 import os
 import pickle
+import tempfile
 from pathlib import Path
 
 # Third-party
@@ -20,8 +21,8 @@ import pandas as pd
 from eplus_gym.envs.env import AmphitheaterEnv
 from eplus_gym.envs.energyplus import (
     _resolve_output_dir,
-    _find_project_root,
 )
+from eplus_gym.seeding import run_seeded_script, seed_suffix
 from eplus_gym.agents.ddqn_mlp.dqn_agent import DDQN_MLP
 
 
@@ -82,11 +83,11 @@ output_root = Path(_resolve_output_dir(None))
 checkpoint_dir = _resolve_output_dir(None, default_name="runs/checkpoints")
 
 CONTROL_PENALTY_CONFIG = {
-    "enable_control_penalty": True,
+    "enable_control_penalty": False,
     "w_switch": 0.3,
     "w_du_sat": 0.04,
     "w_du_oac": 0.04,
-    "enable_iaq_aware_ventilation": True,
+    "enable_iaq_aware_ventilation": False,
     "iaq_co2_threshold": 850.0,
     "iaq_switch_penalty_scale": 0.5,
     "iaq_oac_penalty_scale": 0.35,
@@ -115,9 +116,13 @@ EVAL_LOCATIONS = [
 ]
 
 
-def evaluate_location(location_label: str, location_key: str):
+def evaluate_location(location_label: str, location_key: str, seed: int, run_output_root: Path, detailed_frames: list):
+    current_seed_suffix = seed_suffix(seed)
+    # Per-city EnergyPlus files are temporary; the final CSV contains all cities.
+    run_output_dir = run_output_root / location_key
+    run_output_dir.mkdir(parents=True, exist_ok=True)
     env = AmphitheaterEnv(
-        env_config={"output": str(output_dir), "location": location_key, **CONTROL_PENALTY_CONFIG},
+        env_config={"output": str(run_output_dir), "location": location_key, **CONTROL_PENALTY_CONFIG},
         new_begin_month=1,
         new_end_month=12,
         new_begin_day=1,
@@ -138,7 +143,7 @@ def evaluate_location(location_label: str, location_key: str):
         replace=384,
         eps_dec=0.9 * n_days * 366,
         chkpt_dir=checkpoint_dir,
-        algo='DDQN_MLP',
+        algo=f"DDQN_MLP{current_seed_suffix}",
         env_name='energyplus'
     )
 
@@ -152,7 +157,7 @@ def evaluate_location(location_label: str, location_key: str):
     ahu_cmd_series = []
 
     done = False
-    observation = env.reset()[0]
+    observation = env.reset(seed=seed)[0]
     score = 0
 
     while not done:
@@ -196,8 +201,13 @@ def evaluate_location(location_label: str, location_key: str):
     first_timestep = -96
     last_timestep = 0
 
-    csv_path = (_find_project_root() / "eplus_outputs" / "eplusout.csv")
+    csv_path = run_output_dir / "eplusout.csv"
     data = pd.read_csv(csv_path)
+    detailed = data.copy()
+    detailed.insert(0, "Seed", seed)
+    detailed.insert(1, "City", location_label)
+    detailed.insert(2, "Location", location_key)
+    detailed_frames.append(detailed)
 
     data['Date/Time'] = '2020/' + data['Date/Time'].str.strip()
     data['Date/Time'] = data['Date/Time'].str.replace(r'\s+', ' ', regex=True)
@@ -383,10 +393,11 @@ def _annotate_bars(ax, bars, fmt):
         )
 
 
-def save_summary_plot(results):
+def save_summary_plot(results, seed: int):
+    current_seed_suffix = seed_suffix(seed)
     plots_dir = Path(_resolve_output_dir(None, default_name="runs/plots"))
     plots_dir.mkdir(parents=True, exist_ok=True)
-    plot_path = plots_dir / "eval_generalisation_ddqn_mlp_summary.png"
+    plot_path = plots_dir / f"eval_generalisation_ddqn_mlp_summary{current_seed_suffix}.png"
 
     locations = [item["location"] for item in results]
     average_scores = [item["average_score"] for item in results]
@@ -424,7 +435,8 @@ def save_summary_plot(results):
     print(f"[Saved plot] {plot_path}")
 
 
-def save_summary_metrics(results):
+def save_summary_metrics(results, seed: int):
+    current_seed_suffix = seed_suffix(seed)
     metrics_dir = Path(_resolve_output_dir(None, default_name="runs/metrics"))
     metrics_dir.mkdir(parents=True, exist_ok=True)
     tag_parts = [
@@ -433,17 +445,31 @@ def save_summary_metrics(results):
     ]
     tag = "_".join(tag_parts)
     df = pd.DataFrame(results)
-    metrics_path = metrics_dir / "eval_generalisation_ddqn_mlp_summary.csv"
-    tagged_metrics_path = metrics_dir / f"eval_generalisation_ddqn_mlp_summary_{tag}.csv"
+    metrics_path = metrics_dir / f"eval_generalisation_ddqn_mlp_summary{current_seed_suffix}.csv"
+    tagged_metrics_path = metrics_dir / f"eval_generalisation_ddqn_mlp_summary_{tag}{current_seed_suffix}.csv"
     df.to_csv(metrics_path, index=False)
     df.to_csv(tagged_metrics_path, index=False)
     print(f"[Saved metrics] {metrics_path}")
     print(f"[Saved metrics] {tagged_metrics_path}")
 
 
+def save_detailed_csv(detailed_frames, seed: int):
+    """Save every city's raw timestep rows in a single CSV for this seed."""
+    seed_output_dir = output_dir / "eval_generalisation_ddqn_mlp" / f"seed{seed}"
+    seed_output_dir.mkdir(parents=True, exist_ok=True)
+    csv_path = seed_output_dir / "eplusout.csv"
+    pd.concat(detailed_frames, ignore_index=True, sort=False).to_csv(csv_path, index=False)
+    print(f"[Saved detailed eval CSV, all cities] {csv_path}")
+    return csv_path
+
+
 if __name__ == '__main__':
+    CURRENT_SEED = run_seeded_script()
     results = []
-    for label, key in EVAL_LOCATIONS:
-        results.append(evaluate_location(label, key))
-    save_summary_metrics(results)
-    save_summary_plot(results)
+    detailed_frames = []
+    with tempfile.TemporaryDirectory(prefix="energyplus_eval_") as temporary_output:
+        for label, key in EVAL_LOCATIONS:
+            results.append(evaluate_location(label, key, CURRENT_SEED, Path(temporary_output), detailed_frames))
+        save_detailed_csv(detailed_frames, CURRENT_SEED)
+    save_summary_metrics(results, CURRENT_SEED)
+    save_summary_plot(results, CURRENT_SEED)

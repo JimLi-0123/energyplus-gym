@@ -22,6 +22,7 @@ from eplus_gym.envs.env import AmphitheaterEnv
 from eplus_gym.envs.energyplus import (
     _resolve_output_dir
 )
+from eplus_gym.seeding import run_seeded_script, seed_suffix
 from eplus_gym.agents.ddqn_bilstm.dqn_agent import DDQN_BiLSTM
 
 
@@ -53,12 +54,18 @@ output_root = Path(_resolve_output_dir(None))  # your resolver
 (output_root / ".gitkeep").touch(exist_ok=True)
 
 checkpoint_dir = _resolve_output_dir(None, default_name="runs/checkpoints")
+CURRENT_SEED = run_seeded_script()
+CURRENT_SEED_SUFFIX = seed_suffix(CURRENT_SEED)
+# Preserve this seed's raw evaluation CSV separately from training outputs.
+output_dir = output_dir / "eval_adaptation_ddqn_bilstm" / f"seed{CURRENT_SEED}" / "luxembourg"
+output_dir.mkdir(parents=True, exist_ok=True)
 # --- NEW: where to save figures ---
 plots_dir = Path(r"C:\Projects\energyplus-gym-work\energyplus-gym\runs\plots")
 plots_dir.mkdir(parents=True, exist_ok=True)
 
 def _save_close(fig, fname: str):
-    out = plots_dir / fname
+    path = Path(fname)
+    out = plots_dir / f"{path.stem}{CURRENT_SEED_SUFFIX}{path.suffix}"
     fig.savefig(out, dpi=200, bbox_inches="tight")
     plt.close(fig)
     print(f"[Saved plot] {out}")
@@ -139,7 +146,7 @@ agent = DDQN_BiLSTM(
     replace=384,
     eps_dec=0.9 * n_episodes * 366,
     chkpt_dir=checkpoint_dir,
-    algo='DDQN_BiLSTM',
+    algo=f"DDQN_BiLSTM{CURRENT_SEED_SUFFIX}",
     env_name='energyplus'
 )
 
@@ -155,7 +162,7 @@ ahu_cmd_series = []
 # --------------- Run the environment once, collect rewards ---------------
 state_window = deque(maxlen=96)
 done = False
-observation = env.reset()[0]
+observation = env.reset(seed=CURRENT_SEED)[0]
 state_window.append(observation)
 score = 0
 
@@ -202,6 +209,7 @@ env.close()
 #  CONFIGURATION  – edit here if you want different colours etc.
 # -------------------------------------------------------------
 CSV_PATH = Path(output_dir) / "eplusout.csv"
+print(f"[EnergyPlus eval CSV] {CSV_PATH}")
 
 DATE_SLICE = slice(96, 96*17)             # one week -> 672 rows
 #DATE_SLICE = slice(192, 288)             # one day

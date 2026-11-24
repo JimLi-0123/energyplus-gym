@@ -15,6 +15,8 @@ Created on Wed Jan  7 07:09:02 2026
 
 # Standard library
 import os
+import atexit
+import csv
 import pickle
 from collections import deque
 from pathlib import Path
@@ -27,7 +29,9 @@ import matplotlib.pyplot as plt
 from eplus_gym.envs.env import AmphitheaterEnv
 from eplus_gym.envs.energyplus import (
     _resolve_output_dir)
+from eplus_gym.seeding import run_seeded_script, seed_suffix
 from eplus_gym.agents.q_transformer.dqn_agent import Q_transformer
+from eplus_gym.agents.q_transformer.experiment_naming import gate_aux_tag
 
 
 # -----------------------------------------------------------------------------
@@ -59,7 +63,29 @@ output_root = Path(_resolve_output_dir(None))  # your resolver
 
 checkpoint_dir = _resolve_output_dir(None, default_name="runs/checkpoints")
 
-ALGO_NAME = "CO2-gated-aux-Q-transformer"
+GATE_CONFIG = {
+    "use_gate": True,
+    "use_co2_gate": True,
+    "use_iat_gate": False,
+    "co2_gate_weight": 1.0,
+    "iat_gate_weight": 0.0,
+    "iat_feature_index": 13,
+    "iat_comfort_low": 21.0,
+    "iat_comfort_high": 24.0,
+}
+
+ABLATION_CONFIG = {
+    # Each prediction head requires its flag and a positive loss weight.
+    "use_co2_aux": False,
+    "co2_aux_weight": 0.0,
+    "use_iat_aux": False,
+    "iat_aux_weight": 0.0,
+    "use_occ_aux": True,
+    "occ_aux_weight": 0.1,
+    "occ_feature_index": 7,
+    "occ_predict_delta": True,
+    **GATE_CONFIG,
+}
 
 CONTROL_PENALTY_CONFIG = {
     "enable_control_penalty": False,
@@ -80,8 +106,12 @@ CONTROL_PENALTY_CONFIG = {
     "w_iaq_co2_severity": 0.8,
 }
 
+ALGO_NAME = f"Q-transformer_{gate_aux_tag(ABLATION_CONFIG)}"
+
 #%% Adaptation test (Q-transformer)--------------------------------------------------------------------------------------------------------------------------
 if __name__ == '__main__':
+    CURRENT_SEED = run_seeded_script()
+    CURRENT_SEED_SUFFIX = seed_suffix(CURRENT_SEED)
     
     
     
@@ -110,8 +140,10 @@ if __name__ == '__main__':
         replace=384,
         eps_dec=0.9 * n_episodes,
         chkpt_dir=checkpoint_dir,
-        algo=ALGO_NAME,
-        env_name='energyplus'
+        algo=f"{ALGO_NAME}{CURRENT_SEED_SUFFIX}",
+        env_name='energyplus',
+        record_gradient_diagnostics=True,
+        **ABLATION_CONFIG
     )
 
     agent.q_eval.train()
@@ -126,6 +158,13 @@ if __name__ == '__main__':
     # A rolling buffer to hold up to 96 recent states
     state_window = deque(maxlen=96)
 
+    diagnostics_path = Path(_resolve_output_dir(None, default_name="runs/metrics")) / f"generalisation_{ALGO_NAME}_gradient_diagnostics{CURRENT_SEED_SUFFIX}.csv"
+    diagnostics_path.parent.mkdir(parents=True, exist_ok=True)
+    diagnostics_file = diagnostics_path.open('w', newline='', encoding='utf-8')
+    atexit.register(diagnostics_file.close)
+    diagnostics_writer = None
+    print(f"[Gradient diagnostics] {diagnostics_path}")
+
     for i in range(n_episodes):
         Episode += 1
         done = False
@@ -135,7 +174,7 @@ if __name__ == '__main__':
         # if terminated:  # in case of generalisation test
         if terminated :
             env.close()
-            observation = env.reset()[0]  # or env.reset()
+            observation = env.reset(seed=CURRENT_SEED)[0]  # or env.reset()
             #state_window.clear()
             state_window.append(observation)
 
@@ -161,6 +200,18 @@ if __name__ == '__main__':
             
             agent.store_transition(observation, action, reward, observation_, done)
             agent.learn()
+            if agent.last_gradient_diagnostics is not None:
+                diagnostics_row = {
+                    'seed': CURRENT_SEED, 'episode': Episode,
+                    'environment_step': n_steps + 1, 'epsilon': agent.epsilon,
+                    'co2_gate_weight': GATE_CONFIG['co2_gate_weight'],
+                    'iat_gate_weight': GATE_CONFIG['iat_gate_weight'],
+                    **agent.last_gradient_diagnostics,
+                }
+                if diagnostics_writer is None:
+                    diagnostics_writer = csv.DictWriter(diagnostics_file, fieldnames=list(diagnostics_row))
+                    diagnostics_writer.writeheader()
+                diagnostics_writer.writerow(diagnostics_row)
 
             # Move on
             observation = observation_
@@ -169,6 +220,7 @@ if __name__ == '__main__':
 
         # End of episode
         agent.decrement_epsilon()
+        diagnostics_file.flush()
         scores.append(score)
         steps_array.append(n_steps)
 
@@ -188,9 +240,10 @@ if __name__ == '__main__':
         eps_history.append(agent.epsilon)
 
     env.close()
+    diagnostics_file.close()
     agent.save_models()
     
-    metrics_path = Path(_resolve_output_dir(None, default_name="runs/metrics")) / "generalisation_co2_gated_aux_q_transformer_metrics.pkl"
+    metrics_path = Path(_resolve_output_dir(None, default_name="runs/metrics")) / f"generalisation_{ALGO_NAME}_metrics{CURRENT_SEED_SUFFIX}.pkl"
     save_training_metrics(str(metrics_path), scores, eps_history, steps_array)
     print(f"[Saved metrics] {metrics_path}")
     # -----------------------------------------------------------------
@@ -230,7 +283,7 @@ if __name__ == '__main__':
     plt.title('Scores and Epsilon History Over Episodes')
     fig.tight_layout()
 
-    plot_path = Path(_resolve_output_dir(None, default_name="runs/plots")) / "generalisation_co2_gated_aux_q_transformer_scores_epsilon.png"
+    plot_path = Path(_resolve_output_dir(None, default_name="runs/plots")) / f"generalisation_{ALGO_NAME}_scores_epsilon{CURRENT_SEED_SUFFIX}.png"
     plot_path.parent.mkdir(parents=True, exist_ok=True)
     fig.savefig(plot_path, dpi=200, bbox_inches="tight")
 

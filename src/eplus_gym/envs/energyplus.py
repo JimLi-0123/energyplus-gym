@@ -897,6 +897,16 @@ class EnergyPlusEnv(gym.Env, metaclass=abc.ABCMeta):
         return action
 
     def reset(self, *, seed: Optional[int] = None, options: Optional[Dict[str, Any]] = None):
+        if seed is not None:
+            super().reset(seed=seed)
+            np.random.seed(seed)
+            self.action_space.seed(seed)
+            self.observation_space.seed(seed)
+            self.default_action = self.post_process_action(self.valid_actions[self.action_space.sample()])
+            self.default_action = list(self.default_action)
+            self.default_action.append(0)
+            self.default_action = tuple(self.default_action)
+
         self.episode += 1
         self.timestep = 0
         self.last_obs = self.observation_space.sample()

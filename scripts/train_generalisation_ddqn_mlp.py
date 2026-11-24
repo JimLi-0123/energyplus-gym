@@ -21,6 +21,7 @@ from eplus_gym.envs.env import AmphitheaterEnv
 from eplus_gym.envs.energyplus import (
     _resolve_output_dir
 )
+from eplus_gym.seeding import run_seeded_script, seed_suffix
 from eplus_gym.agents.ddqn_mlp.dqn_agent import DDQN_MLP
 
 
@@ -54,11 +55,11 @@ output_root = Path(_resolve_output_dir(None))  # your resolver
 checkpoint_dir = _resolve_output_dir(None, default_name="runs/checkpoints")
 
 CONTROL_PENALTY_CONFIG = {
-    "enable_control_penalty": True,
+    "enable_control_penalty": False,
     "w_switch": 0.3,
     "w_du_sat": 0.04,
     "w_du_oac": 0.04,
-    "enable_iaq_aware_ventilation": True,
+    "enable_iaq_aware_ventilation": False,
     "iaq_co2_threshold": 850.0,
     "iaq_switch_penalty_scale": 0.5,
     "iaq_oac_penalty_scale": 0.35,
@@ -84,6 +85,8 @@ CONTROL_PENALTY_CONFIG = {
 
 
 if __name__ == '__main__':
+    CURRENT_SEED = run_seeded_script()
+    CURRENT_SEED_SUFFIX = seed_suffix(CURRENT_SEED)
     
     
     
@@ -112,7 +115,7 @@ if __name__ == '__main__':
         replace=384,
         eps_dec=0.9 * n_episodes,
         chkpt_dir=checkpoint_dir,
-        algo='DDQN_MLP',
+        algo=f"DDQN_MLP{CURRENT_SEED_SUFFIX}",
         env_name='energyplus'
     )
 
@@ -136,7 +139,7 @@ if __name__ == '__main__':
         # if terminated:  # in case of generalisation test
         if terminated :
             env.close()
-            observation = env.reset()[0]  # or env.reset()
+            observation = env.reset(seed=CURRENT_SEED)[0]  # or env.reset()
             #state_window.clear()
 
         score = 0
@@ -184,7 +187,7 @@ if __name__ == '__main__':
     env.close()
     agent.save_models()
     
-    metrics_path = Path(_resolve_output_dir(None, default_name="runs/metrics")) / "generalisation_ddqn_mlp_metrics.pkl"
+    metrics_path = Path(_resolve_output_dir(None, default_name="runs/metrics")) / f"generalisation_ddqn_mlp_metrics{CURRENT_SEED_SUFFIX}.pkl"
     save_training_metrics(str(metrics_path), scores, eps_history, steps_array)
     print(f"[Saved metrics] {metrics_path}")
     # -----------------------------------------------------------------
@@ -224,7 +227,7 @@ if __name__ == '__main__':
     plt.title('Scores and Epsilon History Over Episodes')
     fig.tight_layout()
 
-    plot_path = Path(_resolve_output_dir(None, default_name="runs/plots")) / "generalisation_ddqn_mlp_scores_epsilon.png"
+    plot_path = Path(_resolve_output_dir(None, default_name="runs/plots")) / f"generalisation_ddqn_mlp_scores_epsilon{CURRENT_SEED_SUFFIX}.png"
     plot_path.parent.mkdir(parents=True, exist_ok=True)
     fig.savefig(plot_path, dpi=200, bbox_inches="tight")
 

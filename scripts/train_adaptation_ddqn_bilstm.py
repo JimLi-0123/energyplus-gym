@@ -21,6 +21,7 @@ from eplus_gym.envs.env import AmphitheaterEnv
 from eplus_gym.envs.energyplus import (
     _resolve_output_dir
 )
+from eplus_gym.seeding import run_seeded_script, seed_suffix
 from eplus_gym.agents.ddqn_bilstm.dqn_agent import DDQN_BiLSTM
 
 
@@ -72,6 +73,8 @@ def make_training_env(env_config, begin_day: int, end_day: int):
 
 #%% Adaptation test (DDQN_BiLSTM)--------------------------------------------------------------------------------------------------------------------------
 if __name__ == '__main__':
+    CURRENT_SEED = run_seeded_script()
+    CURRENT_SEED_SUFFIX = seed_suffix(CURRENT_SEED)
     
     
     env_config = {
@@ -117,7 +120,7 @@ if __name__ == '__main__':
         replace=384,
         eps_dec=0.9 * n_episodes,
         chkpt_dir=checkpoint_dir,
-        algo='DDQN_BiLSTM',
+        algo=f"DDQN_BiLSTM{CURRENT_SEED_SUFFIX}",
         env_name='energyplus'
     )
 
@@ -140,7 +143,7 @@ if __name__ == '__main__':
 
         env.close()
         env = make_training_env(env_config, begin_day, end_day)
-        observation = env.reset()[0]
+        observation = env.reset(seed=CURRENT_SEED)[0]
         # Keep the original baseline behavior: do not clear the sequence
         # buffer between fixed Jan1-Jan7 episodes.
         state_window.append(observation)
@@ -237,10 +240,10 @@ if __name__ == '__main__':
     fig.tight_layout()
     # plt.show()
     # --- NEW: save metrics + figure (BiLSTM) ---
-    metrics_path = Path(_resolve_output_dir(None, default_name="runs/metrics")) / "adaptation_ddqn_bilstm_metrics.pkl"
+    metrics_path = Path(_resolve_output_dir(None, default_name="runs/metrics")) / f"adaptation_ddqn_bilstm_metrics{CURRENT_SEED_SUFFIX}.pkl"
     save_training_metrics(str(metrics_path), scores, eps_history, steps_array)
 
-    plot_path = Path(_resolve_output_dir(None, default_name="runs/plots")) / "adaptation_ddqn_bilstm_scores_epsilon.png"
+    plot_path = Path(_resolve_output_dir(None, default_name="runs/plots")) / f"adaptation_ddqn_bilstm_scores_epsilon{CURRENT_SEED_SUFFIX}.png"
     plot_path.parent.mkdir(parents=True, exist_ok=True)
     fig.savefig(plot_path, dpi=200, bbox_inches="tight")
     plt.close(fig)
